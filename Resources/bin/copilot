@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""
+cmux copilot wrapper.
+
+When running inside a cmux terminal (CMUX_SURFACE_ID is set), spawns the real
+`copilot` binary in a PTY and fires `cmux notify` after IDLE_THRESHOLD seconds
+of output silence — the reliable signal that copilot is waiting for input,
+regardless of what the TUI looks like (menus, prompts, rich selections).
+
+When outside cmux, transparently execs the real binary unchanged.
+
+Internal PTY mode (used by tests):
+    copilot --pty-mode <cmux_bin> <real_copilot> [args...]
+This skips binary discovery and runs the PTY logic directly — useful for
+testing the idle-detection behaviour without needing a `copilot` binary in PATH.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import os
+import pty
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import termios
+import time
+import tty
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+# Seconds of output silence after which we conclude the child is waiting for
+# input.  350 ms is long enough to not fire mid-stream, short enough to feel
+# immediate when a real prompt appears.
+_IDLE_THRESHOLD: float = float(os.environ.get("CMUX_COPILOT_IDLE_THRESHOLD", "0.35"))
+
+# Any output at all means the child has started; suppress false idle-fires
+# during the child's own startup silence.
+_MIN_OUTPUT_BEFORE_IDLE: int = 1
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _find_real_copilot() -> str | None:
+    """Search PATH for the real copilot binary, skipping our own directory."""
+    own_dir = str(Path(__file__).resolve().parent)
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not entry:
+            continue
+        try:
+            if Path(entry).resolve() == Path(own_dir):
+                continue
+        except OSError:
+            continue
+        candidate = Path(entry) / "copilot"
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
+def _find_cmux_bin() -> str:
+    """Locate the cmux CLI binary bundled alongside this script or in PATH."""
+    bundled = os.environ.get("CMUX_BUNDLED_CLI_PATH", "")
+    if bundled and os.access(bundled, os.X_OK):
+        return bundled
+    sibling = str(Path(__file__).resolve().parent / "cmux")
+    if os.access(sibling, os.X_OK):
+        return sibling
+    found = shutil.which("cmux")
+    return found if found else "cmux"
+
+
+def _sync_winsize(src: int, dst: int) -> None:
+    try:
+        packed = fcntl.ioctl(src, termios.TIOCGWINSZ, b"\x00" * 8)
+        fcntl.ioctl(dst, termios.TIOCSWINSZ, packed)
+    except OSError:
+        pass
+
+
+def _exit_code(raw_status: int) -> int:
+    if hasattr(os, "waitstatus_to_exitcode"):
+        return os.waitstatus_to_exitcode(raw_status)
+    sig = raw_status & 0x7F
+    return (128 + sig) if sig else ((raw_status >> 8) & 0xFF)
+
+
+# ---------------------------------------------------------------------------
+# PTY helper — idle-detection loop
+# ---------------------------------------------------------------------------
+
+
+def run(cmux_bin: str, child_argv: list[str]) -> int:
+    """
+    Spawn child_argv in a PTY, tee output to stdout, and fire `cmux notify`
+    once the child has been silent for _IDLE_THRESHOLD seconds.
+
+    Returns the child's exit code.
+    """
+    notify_title = os.environ.get("CMUX_COPILOT_NOTIFY_TITLE", "Copilot")
+    notify_body = os.environ.get("CMUX_COPILOT_NOTIFY_BODY", "Waiting for your input")
+
+    def fire_notify() -> None:
+        try:
+            subprocess.Popen(
+                [cmux_bin, "notify", "--title", notify_title, "--body", notify_body],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+            )
+        except Exception:
+            pass
+
+    try:
+        pid, master_fd = pty.fork()
+    except OSError:
+        # No PTY available — exec child directly (no notification).
+        os.execvp(child_argv[0], child_argv)
+        return 127  # unreachable
+
+    if pid == 0:  # child
+        try:
+            os.execvp(child_argv[0], child_argv)
+        except Exception:
+            pass
+        os._exit(127)
+
+    # ---- parent ----
+    stdin_fd = sys.stdin.fileno()
+    stdout_fd = sys.stdout.fileno()
+    # Only engage raw mode and stdin forwarding when stdin is a real TTY.
+    # When not a TTY (pipes, tests) we still capture child output correctly.
+    stdin_is_tty = os.isatty(stdin_fd)
+
+    old_attr: list | None = None
+    if stdin_is_tty:
+        try:
+            old_attr = termios.tcgetattr(stdin_fd)
+            tty.setraw(stdin_fd)
+            _sync_winsize(stdin_fd, master_fd)
+        except termios.error:
+            old_attr = None
+
+    def _handle_winch(sig: int, frame: object) -> None:
+        _sync_winsize(stdin_fd, master_fd)
+
+    if stdin_is_tty:
+        signal.signal(signal.SIGWINCH, _handle_winch)
+
+    total_output: int = 0
+    last_output_at: float = 0.0
+    notified: bool = False
+
+    _SELECT_TIMEOUT = min(0.05, _IDLE_THRESHOLD / 4)
+
+    try:
+        while True:
+            watch = [master_fd]
+            if stdin_is_tty:
+                watch.append(stdin_fd)
+
+            try:
+                rfds, _, _ = select.select(watch, [], [], _SELECT_TIMEOUT)
+            except (OSError, ValueError, select.error):
+                break
+
+            if master_fd in rfds:
+                try:
+                    data = os.read(master_fd, 4096)
+                except OSError:
+                    break
+                if not data:
+                    break
+                total_output += len(data)
+                last_output_at = time.monotonic()
+                # Do NOT reset notified here. PTY echo of the user's keystrokes
+                # arrives on master_fd too — resetting here would re-fire the
+                # notification on every typing pause while the user composes
+                # their reply. notified only resets when the user submits (Enter).
+                try:
+                    os.write(stdout_fd, data)
+                except OSError:
+                    break
+
+            if stdin_is_tty and stdin_fd in rfds:
+                try:
+                    data = os.read(stdin_fd, 1024)
+                except OSError:
+                    break
+                if not data:
+                    break
+                # Reset notification state only when the user submits their
+                # response (presses Enter / Return). This lets the next idle
+                # period — when copilot finishes generating and waits again —
+                # trigger a fresh notification, while suppressing re-fires
+                # during the typing of the current reply.
+                if b"\r" in data or b"\n" in data:
+                    notified = False
+                    last_output_at = 0.0
+                try:
+                    os.write(master_fd, data)
+                except OSError:
+                    break
+
+            # Idle check: fire notify once the child has been quiet long enough.
+            if (
+                not notified
+                and total_output >= _MIN_OUTPUT_BEFORE_IDLE
+                and last_output_at > 0.0
+                and (time.monotonic() - last_output_at) >= _IDLE_THRESHOLD
+            ):
+                notified = True
+                fire_notify()
+
+    finally:
+        if old_attr is not None:
+            try:
+                termios.tcsetattr(stdin_fd, termios.TCSAFLUSH, old_attr)
+            except termios.error:
+                pass
+        if stdin_is_tty:
+            signal.signal(signal.SIGWINCH, signal.SIG_DFL)
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+
+    _, raw_status = os.waitpid(pid, 0)
+    return _exit_code(raw_status)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    # Internal PTY mode: used by the test suite to exercise the idle-detection
+    # loop in isolation without needing a real `copilot` binary in PATH.
+    #   copilot --pty-mode <cmux_bin> <child_argv...>
+    if len(sys.argv) >= 2 and sys.argv[1] == "--pty-mode":
+        if len(sys.argv) < 4:
+            print(
+                f"Usage: {sys.argv[0]} --pty-mode <cmux_bin> <child_argv...>",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        sys.exit(run(cmux_bin=sys.argv[2], child_argv=sys.argv[3:]))
+
+    # Normal wrapper mode: find the real binary, pass through or run via PTY.
+    real_bin = _find_real_copilot()
+    if not real_bin:
+        print(
+            "cmux copilot wrapper: could not locate real copilot binary in PATH",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if not os.environ.get("CMUX_SURFACE_ID"):
+        os.execv(real_bin, [real_bin] + sys.argv[1:])
+        sys.exit(1)  # unreachable
+
+    cmux_bin = _find_cmux_bin()
+    sys.exit(run(cmux_bin, [real_bin] + sys.argv[1:]))
+
+
+if __name__ == "__main__":
+    main()
