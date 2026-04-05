@@ -175,6 +175,19 @@ class TestPtyHelperIdleDetection(unittest.TestCase):
             timeout=timeout,
         )
 
+    def _make_timestamped_cmux(self) -> str:
+        """Create a fake cmux that prepends a millisecond timestamp to each log line.
+
+        Used by tests that need to compare when the notification fired against
+        when a child-side event occurred.
+        """
+        path = os.path.join(self.tmp, "cmux-ts")
+        _write_exe(path, textwrap.dedent(f"""\
+            #!/usr/bin/env bash
+            echo "$(python3 -c 'import time; print(int(time.time()*1000))') $@" >> {self.notify_log}
+        """))
+        return path
+
     def _wait_for_notify(self, *, wait: float = 3.0, poll: float = 0.05) -> str:
         """Poll until the notify log has content (Popen write is async)."""
         deadline = time.monotonic() + wait
@@ -365,6 +378,269 @@ class TestPtyHelperIdleDetection(unittest.TestCase):
         log = self._wait_for_notify(wait=5.0)
         notify_lines = [l for l in log.splitlines() if "notify" in l]
         self.assertEqual(len(notify_lines), 1, f"Expected one notify; got {len(notify_lines)}; log={log!r}")
+
+    # -- streaming / false positive edge cases --------------------------------
+
+    def test_streaming_sub_threshold_gaps_fires_once(self) -> None:
+        """Many output bursts separated by short gaps fire exactly one notification.
+
+        Copilot CLI streams tokens as they arrive from the API.  As long as each
+        inter-token gap stays below IDLE_THRESHOLD, we should not notify until the
+        full response has been delivered.
+        """
+        short_gap = float(self.IDLE_THRESHOLD) * 0.4   # well below threshold
+        idle_s = float(self.IDLE_THRESHOLD) * 4
+        self._run_helper(textwrap.dedent(f"""\
+            #!/usr/bin/env bash
+            for i in 1 2 3 4 5; do
+                printf "token $i "
+                sleep {short_gap:.3f}
+            done
+            sleep {idle_s:.2f}
+            exit 0
+        """))
+        log = self._wait_for_notify(wait=5.0)
+        notify_lines = [l for l in log.splitlines() if "notify" in l]
+        self.assertEqual(len(notify_lines), 1,
+            f"Expected one notify after streaming; log={log!r}")
+
+    def test_slow_streaming_gap_fires_during_response(self) -> None:
+        """A >THRESHOLD pause mid-response fires the notification too early.
+
+        KNOWN LIMITATION: when the LLM stalls mid-response for longer than
+        IDLE_THRESHOLD (slow network, large code block), idle detection
+        fires during the response rather than after it.  Because notified
+        stays True for the rest of the session turn, the user never gets the
+        "done waiting" notification — they get one notification at the wrong time.
+
+        This test documents the current (imperfect) behaviour: exactly one
+        notification fires but it fires during the gap between output bursts,
+        not after the response completes.
+        """
+        long_gap = float(self.IDLE_THRESHOLD) * 4   # exceeds threshold → fires
+        idle_s = float(self.IDLE_THRESHOLD) * 4
+        flag_file = os.path.join(self.tmp, "second_burst_started")
+        self._run_helper(textwrap.dedent(f"""\
+            #!/usr/bin/env bash
+            printf 'first part of response'
+            sleep {long_gap:.2f}        # notification fires here (false positive)
+            touch {flag_file}
+            printf 'rest of response'
+            sleep {idle_s:.2f}          # idle: notified=True → no second fire
+            exit 0
+        """), timeout=12.0)
+        log = self._wait_for_notify(wait=5.0)
+        notify_lines = [l for l in log.splitlines() if "notify" in l]
+        # Exactly one notification — but fired during the gap, before second_burst_started.
+        self.assertEqual(len(notify_lines), 1,
+            f"Expected one (premature) notify; log={log!r}")
+        # Verify the timing: notification must have fired BEFORE the second burst.
+        # The second_burst_started flag is created long after the threshold elapses,
+        # so if both files exist, the notification arrived while the gap was ongoing.
+        self.assertTrue(
+            os.path.exists(flag_file),
+            "Child should have completed both bursts",
+        )
+        notify_mtime = os.path.getmtime(self.notify_log)
+        flag_mtime = os.path.getmtime(flag_file)
+        self.assertLess(
+            notify_mtime, flag_mtime,
+            "Notification should have fired during the gap (before second burst started)",
+        )
+
+    # -- stdin key classification: Enter vs non-Enter -------------------------
+
+    def test_non_enter_keys_in_stdin_do_not_reset_notification(self) -> None:
+        """Arrow keys and other non-Enter keys must NOT reset notified.
+
+        In copilot's select-list TUI the user presses up/down arrows to choose
+        an option.  Each arrow key causes copilot to redraw the list (output on
+        master_fd) and then go quiet again.  If a non-Enter keystroke reset
+        notified, we would re-fire the notification on every arrow-key press.
+
+        Scenario: notification fires during first idle, we send an arrow key,
+        child outputs a display update and goes quiet again — assert no second
+        notification fires.
+        """
+        import pty as _pty_mod
+        import threading
+
+        idle_s = float(self.IDLE_THRESHOLD) * 4
+
+        child_bin = os.path.join(self.tmp, "fake-copilot-tui")
+        _write_exe(child_bin, textwrap.dedent(f"""\
+            #!/usr/bin/env bash
+            printf 'copilot response rendered'
+            sleep {idle_s:.2f}              # notification fires here
+            printf 'tui redraws after key'  # simulates arrow-key triggered redraw
+            sleep {idle_s:.2f}              # should NOT notify again
+            exit 0
+        """))
+
+        master_stdin_fd, slave_stdin_fd = _pty_mod.openpty()
+        env = {
+            **os.environ,
+            "CMUX_SURFACE_ID": "test-surface",
+            "CMUX_COPILOT_IDLE_THRESHOLD": self.IDLE_THRESHOLD,
+        }
+
+        proc = subprocess.Popen(
+            [sys.executable, WRAPPER, "--pty-mode", self.fake_cmux, child_bin],
+            stdin=slave_stdin_fd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+        os.close(slave_stdin_fd)
+
+        # Send an up-arrow escape sequence after the first notification fires.
+        # It arrives in the stdin branch; must NOT reset notified.
+        def _send_arrow_key() -> None:
+            time.sleep(float(self.IDLE_THRESHOLD) * 2)  # after first idle
+            try:
+                os.write(master_stdin_fd, b"\x1b[A")
+            except OSError:
+                pass
+
+        t = threading.Thread(target=_send_arrow_key, daemon=True)
+        t.start()
+
+        try:
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        finally:
+            try:
+                os.close(master_stdin_fd)
+            except OSError:
+                pass
+            proc.stdout and proc.stdout.close()
+            proc.stderr and proc.stderr.close()
+        t.join(timeout=2)
+
+        log = self._wait_for_notify(wait=3.0)
+        notify_lines = [l for l in log.splitlines() if "notify" in l]
+        self.assertEqual(len(notify_lines), 1,
+            f"Arrow key must not reset notified; got {len(notify_lines)} notifies; log={log!r}")
+
+    def test_enter_echo_race_fires_before_response(self) -> None:
+        """After Enter, the 2nd notification fires AFTER copilot starts responding.
+
+        When the user presses Enter, the wrapper resets output_since_enter to 0
+        and notified to False.  The PTY line discipline immediately echoes \\r\\n
+        (~2 bytes) back on master_fd, which re-arms last_output_at.  Without the
+        fix this echo alone is enough to make the idle timer fire — the 2nd
+        notification would arrive during the startup gap before copilot has
+        produced a single real output byte.
+
+        The fix: idle is suppressed until output_since_enter >= _MIN_RESPONSE_OUTPUT
+        (5 bytes in this test).  The echo is only ~2 bytes, so idle cannot fire
+        until copilot starts streaming real content.
+
+        Timeline
+        --------
+        t=0          child outputs "first prompt" → idle fires at t≈threshold
+        t=6*thr      thread sends Enter; output_since_enter resets to 0
+        t=6*thr      PTY echo arrives (~2 bytes); output_since_enter=2 < 5 → no fire
+        t=6*thr+gap  child touches child_output_flag, outputs response (>5 bytes)
+                     output_since_enter crosses threshold; idle arms
+        t=…+thr      2nd notification fires — AFTER the flag was created
+
+        Without the fix the 2nd notification fires at t≈6*thr+threshold (well
+        before the flag at t=6*thr+gap).
+        """
+        import pty as _pty_mod
+        import threading
+
+        startup_sleep = float(self.IDLE_THRESHOLD) * 4   # > threshold: clear gap
+        response_sleep = float(self.IDLE_THRESHOLD) * 4
+        child_output_flag = os.path.join(self.tmp, "child_output_flag")
+
+        child_bin = os.path.join(self.tmp, "fake-copilot-enter-echo")
+        _write_exe(child_bin, textwrap.dedent(f"""\
+            #!/usr/bin/env bash
+            printf 'copilot first prompt'
+            read -r _input
+            sleep {startup_sleep:.2f}
+            touch {child_output_flag}
+            printf 'copilot response content here'
+            sleep {response_sleep:.2f}
+            exit 0
+        """))
+
+        # Timestamped fake cmux so we can compare notification vs flag times.
+        timestamped_cmux = self._make_timestamped_cmux()
+
+        master_stdin_fd, slave_stdin_fd = _pty_mod.openpty()
+        env = {
+            **os.environ,
+            "CMUX_SURFACE_ID": "test-surface",
+            "CMUX_COPILOT_IDLE_THRESHOLD": self.IDLE_THRESHOLD,
+            # 5 > PTY echo (~2 bytes) but << actual response content (29 bytes)
+            "CMUX_COPILOT_MIN_RESPONSE_OUTPUT": "5",
+        }
+
+        proc = subprocess.Popen(
+            [sys.executable, WRAPPER, "--pty-mode", timestamped_cmux, child_bin],
+            stdin=slave_stdin_fd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+        os.close(slave_stdin_fd)
+
+        # Send Enter after the first notification fires (same timing as
+        # test_notify_resets_after_new_output).  This is the realistic scenario:
+        # the wrapper is running, the child is at its read-r prompt, the first
+        # idle already fired, and the user now submits their reply.
+        def _send_enter() -> None:
+            time.sleep(float(self.IDLE_THRESHOLD) * 6)
+            try:
+                os.write(master_stdin_fd, b"\r\n")
+            except OSError:
+                pass
+
+        t = threading.Thread(target=_send_enter, daemon=True)
+        t.start()
+
+        try:
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        finally:
+            try:
+                os.close(master_stdin_fd)
+            except OSError:
+                pass
+            proc.stdout and proc.stdout.close()
+            proc.stderr and proc.stderr.close()
+        t.join(timeout=2)
+
+        log = self._wait_for_notify(wait=3.0)
+        notify_lines = [l for l in log.splitlines() if "notify" in l]
+        self.assertGreaterEqual(
+            len(notify_lines), 2,
+            f"Expected at least 2 notifications (first prompt + response); log={log!r}",
+        )
+        self.assertTrue(
+            os.path.exists(child_output_flag),
+            "child_output_flag not created — child did not reach the response phase",
+        )
+
+        # The 2nd notification must fire AFTER the child touched the flag.
+        # Without the fix: fires at Enter+threshold (~150ms), flag at Enter+startup_sleep (~600ms).
+        # With the fix: fires after startup_sleep + response_sleep + threshold (~1.35s after Enter).
+        notify2_ms = int(notify_lines[1].split()[0])
+        flag_mtime_ms = int(os.path.getmtime(child_output_flag) * 1000)
+
+        self.assertGreater(
+            notify2_ms, flag_mtime_ms,
+            f"2nd notification fired before copilot produced any output "
+            f"(notify at {notify2_ms}ms, child output at {flag_mtime_ms}ms) — "
+            f"Enter-echo race condition not fixed",
+        )
 
 
 if __name__ == "__main__":
