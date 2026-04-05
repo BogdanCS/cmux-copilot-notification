@@ -39,9 +39,16 @@ from pathlib import Path
 # immediate when a real prompt appears.
 _IDLE_THRESHOLD: float = float(os.environ.get("CMUX_COPILOT_IDLE_THRESHOLD", "0.35"))
 
-# Any output at all means the child has started; suppress false idle-fires
-# during the child's own startup silence.
-_MIN_OUTPUT_BEFORE_IDLE: int = 1
+# Minimum bytes of child output since the last Enter keystroke before idle
+# detection will fire.  Prevents the PTY echo of "\r\n" (typically 2 bytes)
+# from re-arming the idle timer immediately after the user submits a message —
+# which would cause the notification to fire before copilot has produced any
+# real response (the Enter-echo race).  Any real output from copilot — a
+# spinner frame, ANSI cursor movement, or even a single token — will be well
+# above this threshold.
+_MIN_RESPONSE_OUTPUT: int = int(
+    os.environ.get("CMUX_COPILOT_MIN_RESPONSE_OUTPUT", "10")
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -157,6 +164,12 @@ def run(cmux_bin: str, child_argv: list[str]) -> int:
     total_output: int = 0
     last_output_at: float = 0.0
     notified: bool = False
+    # Bytes of child output since the last Enter keystroke (or since startup).
+    # Initialised to _MIN_RESPONSE_OUTPUT so the very first idle period (no
+    # Enter has been pressed yet) fires normally.  Reset to 0 on Enter so that
+    # the PTY echo of "\r\n" cannot immediately re-arm idle detection before
+    # copilot has produced any real response content.
+    output_since_enter: int = _MIN_RESPONSE_OUTPUT
 
     _SELECT_TIMEOUT = min(0.05, _IDLE_THRESHOLD / 4)
 
@@ -179,6 +192,7 @@ def run(cmux_bin: str, child_argv: list[str]) -> int:
                 if not data:
                     break
                 total_output += len(data)
+                output_since_enter += len(data)
                 last_output_at = time.monotonic()
                 # Do NOT reset notified here. PTY echo of the user's keystrokes
                 # arrives on master_fd too — resetting here would re-fire the
@@ -204,15 +218,18 @@ def run(cmux_bin: str, child_argv: list[str]) -> int:
                 if b"\r" in data or b"\n" in data:
                     notified = False
                     last_output_at = 0.0
+                    output_since_enter = 0
                 try:
                     os.write(master_fd, data)
                 except OSError:
                     break
 
             # Idle check: fire notify once the child has been quiet long enough.
+            # output_since_enter guards against the PTY echo of "\r\n" (2 bytes)
+            # re-arming the timer before copilot has produced any real response.
             if (
                 not notified
-                and total_output >= _MIN_OUTPUT_BEFORE_IDLE
+                and output_since_enter >= _MIN_RESPONSE_OUTPUT
                 and last_output_at > 0.0
                 and (time.monotonic() - last_output_at) >= _IDLE_THRESHOLD
             ):
