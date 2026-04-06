@@ -21,6 +21,13 @@ The wrapper replaces the `copilot` stub in that directory. When you run
 and sends a cmux notification once Copilot goes idle (i.e. it is waiting for
 your input). Outside cmux it transparently passes through to the real binary.
 
+You can still run the real copilot inside cmux if needed by unsetting CMUX_SURFACE_ID
+for the relevant command e.g
+
+```sh
+env -u CMUX_SURFACE_ID copilot
+```
+
 Note that in order to detect whether Copilot is idle the wrapper is relying on
 a couple of heuristics. False positives (or negatives) are possible.
 
