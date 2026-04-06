@@ -10,16 +10,19 @@ Follow the install instructions at **https://github.com/manaflow-ai/cmux/**
 
 ## Install the copilot wrapper
 
-After installing cmux, copy the wrapper into the cmux binary directory:
+After installing cmux, open it and run the following command to copy the wrapper into the cmux binary directory:
 
 ```sh
-cp Resources/bin/copilot /Applications/cmux.app/Contents/Resources/bin/copilot
+cp ./Resources/bin/copilot /Applications/cmux.app/Contents/Resources/bin/copilot
 ```
 
 The wrapper replaces the `copilot` stub in that directory. When you run
 `copilot` inside a cmux terminal, the wrapper spawns the real binary in a PTY
 and sends a cmux notification once Copilot goes idle (i.e. it is waiting for
 your input). Outside cmux it transparently passes through to the real binary.
+
+Note that in order to detect whether Copilot is idle the wrapper is relying on
+a couple of heuristics. False positives (or negatives) are possible.
 
 ## Run the tests
 
